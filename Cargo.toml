@@ -1,0 +1,63 @@
+[package]
+edition      = "2024"
+name         = "lilygo"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[[bin]]
+name = "lilygo"
+path = "./src/main.rs"
+
+
+[dependencies]
+esp-hal = { version = "1.1.0-rc.0", features = ["esp32", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32"] }
+esp-backtrace = { version = "0.18", features = ["esp32", "panic-handler", "println"] }
+esp-alloc = { version = "0.10", features = ["compat"] }
+
+# New async runtime replacing esp-hal-embassy. The `esp-radio` feature wires the
+# BLE/WiFi scheduler into the same executor.
+esp-rtos = { version = "0.3", features = ["esp32", "embassy", "esp-alloc", "esp-radio", "log-04"] }
+esp-radio = { version = "0.18", features = ["esp32", "ble", "log-04", "unstable"] }
+
+embassy-executor = "0.10"
+static_cell = "2"
+embassy-time = "0.4"
+embassy-futures = "0.1"
+embassy-sync = "0.7"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+
+lora-phy = "3"
+ssd1306 = "0.9"
+embedded-graphics = "0.8"
+
+trouble-host = { version = "0.6", features = ["gatt", "peripheral", "default-packet-pool-mtu-128"] }
+
+critical-section = "1.2.0"
+heapless = "0.8"
+esp-println = { version = "0.16", default-features = false, features = ["esp32", "uart", "log-04", "critical-section", "colors"] }
+log = "0.4"
+esp-storage = { version = "0.9.0", features = ["esp32"] }
+embedded-storage = "0.3.1"
+sh1106 = "0.5.0"
+
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+opt-level = "s"
+
+[profile.dev.package.esp-storage]
+opt-level = 3
+
+[profile.release]
+codegen-units    = 1     # LLVM can perform better optimizations using a single thread
+debug            = 2
+debug-assertions = false
+incremental      = false
+lto              = 'fat'
+opt-level        = 's'
+overflow-checks  = true
