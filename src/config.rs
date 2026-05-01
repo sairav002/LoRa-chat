@@ -10,6 +10,8 @@
 pub const LORA_FREQUENCY_HZ: u32 = 868_000_000;
 pub const LORA_MAX_PAYLOAD: usize = 128;
 pub const LORA_PREAMBLE_SYMBOLS: u16 = 8;
+/// How long to sleep between CAD polls when the channel is idle (milliseconds).
+pub const LORA_CAD_SLEEP_MS: u64 = 50;
 
 // ── Channels ──────────────────────────────────────────────────────────
 /// Depth of the display event queue (radio/UART → display task).

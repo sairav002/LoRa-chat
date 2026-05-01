@@ -147,6 +147,22 @@ impl Radio {
         true
     }
 
+    /// Run one Channel Activity Detection cycle.
+    /// Returns `true` if preamble activity was detected, `false` if the channel is idle.
+    pub async fn cad(&mut self) -> bool {
+        if let Err(e) = self.lora.prepare_for_cad(&self.mdltn_params).await {
+            log::error!("CAD prepare failed: {:?}", e);
+            return false;
+        }
+        match self.lora.cad(&self.mdltn_params).await {
+            Ok(detected) => detected,
+            Err(e) => {
+                log::error!("CAD failed: {:?}", e);
+                false
+            }
+        }
+    }
+
     /// Put the radio into continuous receive mode.
     pub async fn enter_rx(&mut self) -> bool {
         if let Err(e) = self

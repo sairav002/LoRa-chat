@@ -5,6 +5,7 @@ use heapless::String;
 use crate::{
     BLE_CHANNEL, SETTINGS_CHANGED, TX_CHANNEL, UI_CHANNEL,
     ble::BleMessage,
+    config::LORA_CAD_SLEEP_MS,
     display::UIEvent,
     protocol::{Protocol, RxResult, TimeoutAction},
     radio::Radio,
@@ -20,64 +21,24 @@ pub async fn coordinator_task(mut radio: Radio) {
     log::info!("Coordinator started");
 
     loop {
-        if !radio.enter_rx().await {
-            Timer::after(Duration::from_millis(100)).await;
-            continue;
-        }
         let deadline = proto.earliest_deadline();
 
-        let incoming = radio.receive(&mut recv_buf);
         let outgoing = TX_CHANNEL.receive();
-        let deadline = async {
+        let deadline_fut = async {
             match deadline {
                 Some(dl) => Timer::at(dl).await,
                 None => core::future::pending().await,
             }
         };
         let settings = SETTINGS_CHANGED.wait();
+        // CAD sleep: how long to wait between channel activity checks.
+        let cad_window = Timer::after(Duration::from_millis(LORA_CAD_SLEEP_MS));
 
-        // Await on 4 possible states
-        match select4(incoming, outgoing, deadline, settings).await {
+        match select4(outgoing, deadline_fut, settings, cad_window).await {
             // ==================================
-            // --- Received a packet ---
+            // --- Outgoing message ---
             // ==================================
-            Either4::First((len, _status)) => match proto.on_receive(&recv_buf, len as usize) {
-                // A new Message has been received
-                RxResult::NewMessage { packet, ack_reply } => {
-                    radio.send(&ack_reply).await;
-
-                    display
-                        .send(UIEvent::MessageReceived {
-                            id: packet.id,
-                            text: packet.text.clone(),
-                        })
-                        .await;
-
-                    ble_channel.send(BleMessage(packet.text)).await;
-                }
-                // The message has already been received. The ACK is resent.
-                RxResult::Duplicate { ack_reply } => {
-                    radio.send(&ack_reply).await;
-                    log::debug!("Duplicate message, re-ACKed");
-                }
-                // An ACK for certain message has been confirmed.
-                RxResult::AckReceived { id } => {
-                    log::info!("ACK received for id={}", id);
-                    display.send(UIEvent::MessageConfirmed { id }).await;
-                }
-                // A non-registered ACK has been received
-                RxResult::UnexpectedAck { id } => {
-                    log::warn!("Unexpected ACK for id={}, ignoring", id);
-                }
-                RxResult::ParseError(e) => {
-                    log::error!("Malformed frame: {:?}", e);
-                }
-            },
-
-            // ==================================
-            // --- Outgoing message from UART (but any source in the future) ---
-            // ==================================
-            Either4::Second(request) => {
+            Either4::First(request) => {
                 let mut text = String::<124>::new();
                 let _ = text.push_str(str::from_utf8(&request.payload).unwrap());
 
@@ -88,8 +49,6 @@ pub async fn coordinator_task(mut radio: Radio) {
                     _ => match proto.frame_outgoing(0, &request.payload) {
                         Some((id, wire)) => {
                             log::info!("packet: {wire:?}");
-                            // Show the message immediately (pending status).
-                            // Confirmed/Discarded events update it after ACK or timeout.
                             display.send(UIEvent::MessageSent { id, text }).await;
                             radio.send(&wire).await;
                         }
@@ -103,7 +62,7 @@ pub async fn coordinator_task(mut radio: Radio) {
             // ==================================
             // --- ACK Timeout ---
             // ==================================
-            Either4::Third(_) => {
+            Either4::Second(_) => {
                 let actions = proto.process_timeouts(embassy_time::Instant::now());
                 for action in actions {
                     match action {
@@ -120,11 +79,49 @@ pub async fn coordinator_task(mut radio: Radio) {
             }
 
             // ==================================
-            // --- Radio Settings ---
+            // --- Radio Settings Changed ---
             // ==================================
-            Either4::Fourth(_) => {
+            Either4::Third(_) => {
                 if radio.apply_settings().await {
                     log::info!("Radio settings applied");
+                }
+            }
+
+            // ==================================
+            // --- CAD window: poll for channel activity ---
+            // ==================================
+            Either4::Fourth(_) => {
+                if radio.cad().await {
+                    // Preamble detected — switch to full RX to receive the packet.
+                    if radio.enter_rx().await {
+                        let (len, _status) = radio.receive(&mut recv_buf).await;
+                        match proto.on_receive(&recv_buf, len as usize) {
+                            RxResult::NewMessage { packet, ack_reply } => {
+                                radio.send(&ack_reply).await;
+                                display
+                                    .send(UIEvent::MessageReceived {
+                                        id: packet.id,
+                                        text: packet.text.clone(),
+                                    })
+                                    .await;
+                                ble_channel.send(BleMessage(packet.text)).await;
+                            }
+                            RxResult::Duplicate { ack_reply } => {
+                                radio.send(&ack_reply).await;
+                                log::debug!("Duplicate message, re-ACKed");
+                            }
+                            RxResult::AckReceived { id } => {
+                                log::info!("ACK received for id={}", id);
+                                display.send(UIEvent::MessageConfirmed { id }).await;
+                            }
+                            RxResult::UnexpectedAck { id } => {
+                                log::warn!("Unexpected ACK for id={}, ignoring", id);
+                            }
+                            RxResult::ParseError(e) => {
+                                log::error!("Malformed frame: {:?}", e);
+                            }
+                        }
+                    }
                 }
             }
         }
