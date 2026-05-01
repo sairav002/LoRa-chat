@@ -1,9 +1,8 @@
 /// Radio hardware layer — LoRa configuration, transmit, and receive.
 ///
-/// This module owns the SPI/LoRa driver and exposes a minimal API:
-/// `new()`, `apply_settings()`, `send()`, `enter_rx()`, `receive()`.
-///
-/// It has no knowledge of protocol, channels, or events.
+/// This module owns the SPI/LoRa driver and exposes a minimal API via
+/// `RadioTrait`. The concrete `Radio` type implements that trait against real
+/// hardware; tests can supply a mock implementation instead.
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
@@ -19,6 +18,36 @@ use crate::config::LORA_PREAMBLE_SYMBOLS;
 pub type RadioSpi = ExclusiveDevice<Spi<'static, esp_hal::Async>, Output<'static>, Delay>;
 pub type RadioIv = GenericSx127xInterfaceVariant<Output<'static>, Input<'static>>;
 type RadioDriver = Sx127x<RadioSpi, RadioIv, Sx1276>;
+
+// ── Trait ─────────────────────────────────────────────────────────────
+
+/// Abstraction over the LoRa radio hardware.
+///
+/// All coordinator logic is written against this trait so that tests can
+/// inject a mock without touching real hardware.
+pub trait RadioTrait {
+    /// Run one Channel Activity Detection cycle.
+    /// Returns `true` if preamble activity was detected.
+    async fn cad(&mut self) -> bool;
+
+    /// Put the radio into continuous receive mode.
+    /// Returns `false` on hardware error.
+    async fn enter_rx(&mut self) -> bool;
+
+    /// Wait for one incoming frame. Must call `enter_rx()` first.
+    /// Returns `(length, success)`.
+    async fn receive(&mut self, buf: &mut [u8]) -> (u8, bool);
+
+    /// Transmit a payload.
+    /// Returns `false` on hardware error.
+    async fn send(&mut self, payload: &[u8]) -> bool;
+
+    /// Rebuild modulation params from the current `RADIO_SETTINGS` mutex.
+    /// Returns `false` on hardware error.
+    async fn apply_settings(&mut self) -> bool;
+}
+
+// ── Concrete hardware implementation ──────────────────────────────────
 
 pub struct Radio {
     lora: LoRa<RadioDriver, Delay>,
@@ -46,7 +75,6 @@ impl Radio {
             }
         };
 
-        // Read initial settings from the shared config.
         let (sf, bw, cr, freq, tx_power_dbm) = {
             let s = crate::RADIO_SETTINGS.lock().await;
             (
@@ -88,10 +116,72 @@ impl Radio {
             tx_power_dbm,
         })
     }
+}
 
-    /// Rebuild modulation and packet params from the current RADIO_SETTINGS.
-    /// Call this after the menu writes new values to the shared config.
-    pub async fn apply_settings(&mut self) -> bool {
+impl RadioTrait for Radio {
+    async fn cad(&mut self) -> bool {
+        if let Err(e) = self.lora.prepare_for_cad(&self.mdltn_params).await {
+            log::error!("CAD prepare failed: {:?}", e);
+            return false;
+        }
+        match self.lora.cad(&self.mdltn_params).await {
+            Ok(detected) => detected,
+            Err(e) => {
+                log::error!("CAD failed: {:?}", e);
+                false
+            }
+        }
+    }
+
+    async fn enter_rx(&mut self) -> bool {
+        if let Err(e) = self
+            .lora
+            .prepare_for_rx(RxMode::Continuous, &self.mdltn_params, &self.rx_params)
+            .await
+        {
+            log::error!("Failed to enter RX mode: {:?}", e);
+            return false;
+        }
+        true
+    }
+
+    async fn receive(&mut self, buf: &mut [u8]) -> (u8, bool) {
+        match self.lora.rx(&self.rx_params, buf).await {
+            Ok((len, _status)) => {
+                log::debug!("PACKET");
+                (len, true)
+            }
+            Err(e) => {
+                log::error!("RX failed: {:?}", e);
+                (0, false)
+            }
+        }
+    }
+
+    async fn send(&mut self, payload: &[u8]) -> bool {
+        if let Err(e) = self
+            .lora
+            .prepare_for_tx(
+                &self.mdltn_params,
+                &mut self.tx_params,
+                self.tx_power_dbm,
+                payload,
+            )
+            .await
+        {
+            log::error!("prepare_for_tx failed: {:?}", e);
+            return false;
+        }
+
+        if let Err(e) = self.lora.tx().await {
+            log::error!("tx failed: {:?}", e);
+            return false;
+        }
+
+        true
+    }
+
+    async fn apply_settings(&mut self) -> bool {
         let (sf, bw, cr, freq, tx_power_dbm) = {
             let s = crate::RADIO_SETTINGS.lock().await;
             (
@@ -144,66 +234,6 @@ impl Radio {
         self.rx_params = rx_params;
         self.tx_params = tx_params;
         self.tx_power_dbm = tx_power_dbm;
-        true
-    }
-
-    /// Run one Channel Activity Detection cycle.
-    /// Returns `true` if preamble activity was detected, `false` if the channel is idle.
-    pub async fn cad(&mut self) -> bool {
-        if let Err(e) = self.lora.prepare_for_cad(&self.mdltn_params).await {
-            log::error!("CAD prepare failed: {:?}", e);
-            return false;
-        }
-        match self.lora.cad(&self.mdltn_params).await {
-            Ok(detected) => detected,
-            Err(e) => {
-                log::error!("CAD failed: {:?}", e);
-                false
-            }
-        }
-    }
-
-    /// Put the radio into continuous receive mode.
-    pub async fn enter_rx(&mut self) -> bool {
-        if let Err(e) = self
-            .lora
-            .prepare_for_rx(RxMode::Continuous, &self.mdltn_params, &self.rx_params)
-            .await
-        {
-            log::error!("Failed to enter RX mode: {:?}", e);
-            return false;
-        }
-        true
-    }
-
-    /// Wait for an incoming frame. Must call `enter_rx()` first.
-    pub async fn receive(&mut self, buf: &mut [u8]) -> (u8, PacketStatus) {
-        let a = self.lora.rx(&self.rx_params, buf).await.unwrap();
-        log::debug!("PACKET");
-        a
-    }
-
-    /// Transmit a payload.
-    pub async fn send(&mut self, payload: &[u8]) -> bool {
-        if let Err(e) = self
-            .lora
-            .prepare_for_tx(
-                &self.mdltn_params,
-                &mut self.tx_params,
-                self.tx_power_dbm,
-                payload,
-            )
-            .await
-        {
-            log::error!("prepare_for_tx failed: {:?}", e);
-            return false;
-        }
-
-        if let Err(e) = self.lora.tx().await {
-            log::error!("tx failed: {:?}", e);
-            return false;
-        }
-
         true
     }
 }
