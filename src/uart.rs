@@ -1,10 +1,3 @@
-/// UART task — reads newline-delimited text from a serial port and
-/// submits raw text as TX requests to the radio task.
-///
-/// The radio task is responsible for assigning sequence IDs and
-/// framing the wire payload.
-///
-/// Lines longer than 128 bytes are truncated.
 use esp_hal::uart::Uart;
 use heapless::Vec;
 
