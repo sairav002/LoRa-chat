@@ -37,15 +37,13 @@ mod display;
 mod events;
 mod protocol;
 mod radio;
+mod session;
 mod settings;
 mod storage;
 mod uart;
 
-pub static UI_CHANNEL: Channel<
-    CriticalSectionRawMutex,
-    display::UIEvent,
-    DISPLAY_CHANNEL_SIZE,
-> = Channel::new();
+pub static UI_CHANNEL: Channel<CriticalSectionRawMutex, display::UIEvent, DISPLAY_CHANNEL_SIZE> =
+    Channel::new();
 
 pub static TX_CHANNEL: Channel<CriticalSectionRawMutex, TxRequest, TX_CHANNEL_SIZE> =
     Channel::new();

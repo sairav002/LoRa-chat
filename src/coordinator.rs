@@ -1,24 +1,202 @@
 use embassy_futures::select::{Either4, select4};
-use embassy_time::{Duration, Timer};
-use heapless::String;
+use embassy_time::{Duration, Instant, Timer};
+use heapless::{String, Vec};
 
 use crate::{
     BLE_CHANNEL, SETTINGS_CHANGED, TX_CHANNEL, UI_CHANNEL,
     ble::BleMessage,
-    config::LORA_CAD_SLEEP_MS,
+    config::{LBT_BACKOFF_BASE_MS, LBT_MAX_ATTEMPTS, LORA_MAX_PAYLOAD},
     display::UIEvent,
     events::TxRequest,
-    protocol::{Protocol, RxResult, TimeoutAction},
-    radio::RadioTrait,
+    protocol::{MAX_TEXT, MessagePacket, Packet, ProtocolError, encode_ack},
+    radio::{RadioError, RadioTrait},
+    session::{Session, TimeoutAction},
 };
 
-// ── Input parsing ──────────────────────────────────────────────────────
+// -- Coordinator errors ---------------------------------------------------------
 
-/// Classify a raw input payload before it reaches the coordinator.
-///
-/// Navigation commands come from UART/BLE as plain text but are UI concerns,
-/// not radio/protocol concerns. Separating them here keeps the coordinator
-/// arms focused on a single job each.
+enum CoordinatorError {
+    Radio(RadioError),
+    Protocol(ProtocolError),
+}
+
+impl From<RadioError> for CoordinatorError {
+    fn from(e: RadioError) -> Self {
+        CoordinatorError::Radio(e)
+    }
+}
+
+impl From<ProtocolError> for CoordinatorError {
+    fn from(e: ProtocolError) -> Self {
+        CoordinatorError::Protocol(e)
+    }
+}
+
+// -- Coordinator ---------------------------------------------------------------
+
+struct Coordinator<R> {
+    radio: R,
+    session: Session,
+}
+
+impl<R: RadioTrait> Coordinator<R> {
+    fn new(radio: R) -> Self {
+        Self {
+            radio,
+            session: Session::new(),
+        }
+    }
+
+    async fn run(&mut self) -> ! {
+        let mut recv_buf = [0u8; LORA_MAX_PAYLOAD];
+        log::info!("Coordinator started");
+
+        loop {
+            let deadline_fut = async {
+                match self.session.earliest_deadline() {
+                    Some(dl) => Timer::at(dl).await,
+                    None => core::future::pending().await,
+                }
+            };
+
+            match select4(
+                self.radio.receive(&mut recv_buf),
+                TX_CHANNEL.receive(),
+                deadline_fut,
+                SETTINGS_CHANGED.wait(),
+            )
+            .await
+            {
+                Either4::First(result) => {
+                    if let Err(_) = self.handle_recv(result, &recv_buf).await {
+                        log::warn!("RX processing error, continuing");
+                    }
+                }
+                Either4::Second(request) => self.handle_send(request).await,
+                Either4::Third(_) => self.handle_timeouts().await,
+                Either4::Fourth(_) => {
+                    if let Err(_) = self.radio.apply_settings().await {
+                        log::error!("apply_settings failed, keeping previous settings");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_recv(
+        &mut self,
+        recv_result: Result<usize, RadioError>,
+        buf: &[u8],
+    ) -> Result<(), CoordinatorError> {
+        let len = recv_result?;
+
+        let display = UI_CHANNEL.sender();
+        let ble = BLE_CHANNEL.sender();
+
+        match Packet::parse(&buf[..len])? {
+            Packet::Message(msg) => {
+                let ack = encode_ack(msg.id);
+                transmit_lbt(&mut self.radio, &ack).await;
+
+                if self.session.is_duplicate(msg.id) {
+                    log::debug!("Duplicate id={}, re-ACKed", msg.id);
+                    return Ok(());
+                }
+                self.session.record(msg.id);
+
+                display
+                    .send(UIEvent::MessageReceived {
+                        id: msg.id,
+                        text: msg.text.clone(),
+                    })
+                    .await;
+                ble.send(BleMessage(msg.text)).await;
+            }
+            Packet::Ack(ack) => {
+                if self.session.on_ack(ack.id) {
+                    log::info!("ACK received id={}", ack.id);
+                    display.send(UIEvent::MessageConfirmed { id: ack.id }).await;
+                } else {
+                    log::warn!("Unexpected ACK id={}, ignoring", ack.id);
+                }
+            }
+            _ => log::debug!("Unhandled packet type, ignoring"),
+        }
+
+        Ok(())
+    }
+
+    async fn handle_send(&mut self, request: TxRequest) {
+        let display = UI_CHANNEL.sender();
+
+        match parse_input(&request.payload) {
+            InputCommand::NavUp => display.send(UIEvent::NavUp).await,
+            InputCommand::NavDown => display.send(UIEvent::NavDown).await,
+            InputCommand::NavMenu => display.send(UIEvent::NavMenu).await,
+            InputCommand::Message(raw) => {
+                let text_str = match core::str::from_utf8(raw) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        log::warn!("Outgoing payload is not valid UTF-8, dropping");
+                        return;
+                    }
+                };
+
+                let text: String<MAX_TEXT> = match String::try_from(text_str) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        log::warn!("Outgoing payload too long, dropping");
+                        return;
+                    }
+                };
+
+                let id = self.session.next_id();
+                let msg = MessagePacket::new(0, id, text.clone());
+
+                let mut wire: Vec<u8, LORA_MAX_PAYLOAD> = Vec::new();
+                let _ = wire.resize_default(LORA_MAX_PAYLOAD);
+                let len = match msg.encode(&mut wire) {
+                    Some(l) => l,
+                    None => {
+                        log::warn!("Failed to encode outgoing message, dropping");
+                        return;
+                    }
+                };
+                wire.truncate(len);
+
+                if !self.session.track(id, wire.clone()) {
+                    log::warn!("Pending ACK queue full, dropping TX request");
+                    return;
+                }
+
+                log::info!("TX id={} len={}", id, len);
+                display.send(UIEvent::MessageSent { id, text }).await;
+                transmit_lbt(&mut self.radio, &wire).await;
+            }
+        }
+    }
+
+    async fn handle_timeouts(&mut self) {
+        let display = UI_CHANNEL.sender();
+        let actions = self.session.process_timeouts(Instant::now());
+
+        for action in actions {
+            match action {
+                TimeoutAction::Retry { id, wire } => {
+                    log::warn!("ACK timeout id={}, retransmitting", id);
+                    transmit_lbt(&mut self.radio, &wire).await;
+                }
+                TimeoutAction::GiveUp { id } => {
+                    log::error!("Gave up id={}", id);
+                    display.send(UIEvent::MessageDiscarded { id }).await;
+                }
+            }
+        }
+    }
+}
+
+// -- Input parsing -------------------------------------------------------------
+
 pub enum InputCommand<'a> {
     NavUp,
     NavDown,
@@ -35,151 +213,34 @@ pub fn parse_input(payload: &[u8]) -> InputCommand<'_> {
     }
 }
 
-// ── Coordinator arms ───────────────────────────────────────────────────
+// -- Listen Before Talk --------------------------------------------------------
 
-/// Handle one outgoing input request: dispatch nav events or frame and transmit
-/// a message.
-async fn handle_outgoing<R: RadioTrait>(
-    request: TxRequest,
-    proto: &mut Protocol,
-    radio: &mut R,
-) {
-    let display = UI_CHANNEL.sender();
-
-    match parse_input(&request.payload) {
-        InputCommand::NavUp => display.send(UIEvent::NavUp).await,
-        InputCommand::NavDown => display.send(UIEvent::NavDown).await,
-        InputCommand::NavMenu => display.send(UIEvent::NavMenu).await,
-        InputCommand::Message(raw) => {
-            let text = match core::str::from_utf8(raw) {
-                Ok(s) => {
-                    let mut t = String::<124>::new();
-                    let _ = t.push_str(s);
-                    t
-                }
-                Err(_) => {
-                    log::warn!("Outgoing payload is not valid UTF-8, dropping");
-                    return;
-                }
-            };
-
-            match proto.frame_outgoing(0, raw) {
-                Some((id, wire)) => {
-                    log::info!("packet: {wire:?}");
-                    display.send(UIEvent::MessageSent { id, text }).await;
-                    radio.send(&wire).await;
-                }
-                None => log::warn!("Pending ACK queue full, dropping TX request"),
+/// CSMA-style transmit: run CAD, transmit if clear, otherwise back off and retry.
+async fn transmit_lbt<R: RadioTrait>(radio: &mut R, payload: &[u8]) -> bool {
+    for attempt in 0..LBT_MAX_ATTEMPTS {
+        match radio.cad().await {
+            Ok(false) => return radio.send(payload).await.is_ok(),
+            Ok(true) => {
+                let backoff = lbt_backoff_ms(attempt);
+                log::debug!("Channel busy, backing off {} ms", backoff);
+                Timer::after(Duration::from_millis(backoff)).await;
             }
+            Err(_) => return false,
         }
     }
+    log::warn!("LBT gave up after {} attempts", LBT_MAX_ATTEMPTS);
+    false
 }
 
-/// Run one CAD poll. If activity is detected, receive one packet, run it
-/// through the protocol state machine, and dispatch results.
-async fn handle_cad<R: RadioTrait>(proto: &mut Protocol, radio: &mut R, buf: &mut [u8]) {
-    if !radio.cad().await {
-        return;
-    }
-
-    if !radio.enter_rx().await {
-        return;
-    }
-
-    let (len, ok) = radio.receive(buf).await;
-    if !ok {
-        return;
-    }
-
-    let display = UI_CHANNEL.sender();
-    let ble_channel = BLE_CHANNEL.sender();
-
-    match proto.on_receive(buf, len as usize) {
-        RxResult::NewMessage { packet, ack_reply } => {
-            radio.send(&ack_reply).await;
-            display
-                .send(UIEvent::MessageReceived {
-                    id: packet.id,
-                    text: packet.text.clone(),
-                })
-                .await;
-            ble_channel.send(BleMessage(packet.text)).await;
-        }
-        RxResult::Duplicate { ack_reply } => {
-            radio.send(&ack_reply).await;
-            log::debug!("Duplicate message, re-ACKed");
-        }
-        RxResult::AckReceived { id } => {
-            log::info!("ACK received for id={}", id);
-            display.send(UIEvent::MessageConfirmed { id }).await;
-        }
-        RxResult::UnexpectedAck { id } => {
-            log::warn!("Unexpected ACK for id={}, ignoring", id);
-        }
-        RxResult::ParseError(e) => {
-            log::error!("Malformed frame: {:?}", e);
-        }
-    }
+fn lbt_backoff_ms(attempt: u8) -> u64 {
+    let base = LBT_BACKOFF_BASE_MS << attempt.min(5);
+    let jitter = (Instant::now().as_ticks() & 0x3F) as u64;
+    base + jitter
 }
 
-/// Process any expired ACK deadlines and retransmit or give up.
-async fn handle_timeouts<R: RadioTrait>(proto: &mut Protocol, radio: &mut R) {
-    let display = UI_CHANNEL.sender();
-    let actions = proto.process_timeouts(embassy_time::Instant::now());
-
-    for action in actions {
-        match action {
-            TimeoutAction::Retry { id, wire_payload } => {
-                log::warn!("ACK timeout for id={}, retransmitting", id);
-                radio.send(&wire_payload).await;
-            }
-            TimeoutAction::GiveUp { id } => {
-                log::error!("Gave up on id={}", id);
-                display.send(UIEvent::MessageDiscarded { id }).await;
-            }
-        }
-    }
-}
-
-// ── Task entry point ───────────────────────────────────────────────────
+// -- Task entry point ----------------------------------------------------------
 
 #[embassy_executor::task]
-pub async fn coordinator_task(mut radio: crate::radio::Radio) {
-    run_coordinator(&mut radio).await;
-}
-
-/// Core coordinator loop, generic over any `RadioTrait` implementation.
-///
-/// Separated from the `#[embassy_executor::task]` entry point so it can be
-/// driven in tests with a mock radio.
-pub async fn run_coordinator<R: RadioTrait>(radio: &mut R) {
-    let mut proto = Protocol::new();
-    let mut recv_buf = [0u8; 255];
-
-    log::info!("Coordinator started");
-
-    loop {
-        let deadline = proto.earliest_deadline();
-
-        let outgoing = TX_CHANNEL.receive();
-        let deadline_fut = async {
-            match deadline {
-                Some(dl) => Timer::at(dl).await,
-                None => core::future::pending().await,
-            }
-        };
-        let settings = SETTINGS_CHANGED.wait();
-        let cad_window = Timer::after(Duration::from_millis(LORA_CAD_SLEEP_MS));
-
-        match select4(outgoing, deadline_fut, settings, cad_window).await {
-            Either4::First(request) => handle_outgoing(request, &mut proto, radio).await,
-            Either4::Second(_) => handle_timeouts(&mut proto, radio).await,
-            Either4::Third(_) => {
-                if radio.apply_settings().await {
-                    log::info!("Radio settings applied");
-                }
-            }
-            Either4::Fourth(_) => handle_cad(&mut proto, radio, &mut recv_buf).await,
-        }
-    }
+pub async fn coordinator_task(radio: crate::radio::Radio) {
+    Coordinator::new(radio).run().await;
 }

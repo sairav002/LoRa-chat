@@ -1,25 +1,19 @@
-use embassy_time::{Duration, Instant};
-use heapless::{String, Vec};
+use heapless::String;
 
 use crate::config::LORA_MAX_PAYLOAD;
 
-const MAX_RETRIES: u8 = 2;
-const ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_PENDING_ACKS: usize = 5;
-const DEDUP_WINDOW: usize = 16;
-
-// ── Wire format constants ────────────────────────────────────────────
+// ── Wire format ──────────────────────────────────────────────────────────────
 //
 //  Byte 0:        [type:4 | dest:4]
 //  Byte 1:        id
-//  Byte 2:        size (text length, 0..=124)
+//  Byte 2:        size  (text length, 0..=MAX_TEXT)
 //  Bytes 3..3+n:  UTF-8 text payload
-//  Byte 3+n:      checksum (XOR of bytes 0..3+n)
+//  Byte 3+n:      checksum (XOR of bytes 0..3+n-1, i.e. the header + payload)
 
 const HEADER_SIZE: usize = 3;
 const CHECKSUM_SIZE: usize = 1;
 const OVERHEAD: usize = HEADER_SIZE + CHECKSUM_SIZE;
-const MAX_TEXT: usize = LORA_MAX_PAYLOAD - OVERHEAD;
+pub const MAX_TEXT: usize = LORA_MAX_PAYLOAD - OVERHEAD;
 
 const TYPE_MESSAGE: u8 = 0;
 const TYPE_ACK: u8 = 1;
@@ -27,9 +21,9 @@ const TYPE_PING: u8 = 2;
 const TYPE_GPS: u8 = 3;
 const TYPE_RESEND: u8 = 4;
 
-// --- Error type ---
+// ── Error ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ProtocolError {
     TooShort,
     InvalidType(u8),
@@ -38,7 +32,7 @@ pub enum ProtocolError {
     BadChecksum,
 }
 
-// --- Packet types ---
+// ── Packet types ─────────────────────────────────────────────────────────────
 
 pub struct MessagePacket {
     pub dest: u8,
@@ -58,20 +52,21 @@ pub enum Packet {
     Resend,
 }
 
+// ── Checksum ─────────────────────────────────────────────────────────────────
+
 fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |acc, &b| acc ^ b)
 }
 
+// ── Packet: parse ─────────────────────────────────────────────────────────────
+
 impl Packet {
-    /// Parse a raw frame from the wire.
     pub fn parse(raw: &[u8]) -> Result<Self, ProtocolError> {
         if raw.is_empty() {
             return Err(ProtocolError::TooShort);
         }
 
-        let pkt_type = raw[0] >> 4;
-
-        match pkt_type {
+        match raw[0] >> 4 {
             TYPE_MESSAGE => MessagePacket::parse(raw).map(Packet::Message),
             TYPE_ACK => AckPacket::parse(raw).map(Packet::Ack),
             TYPE_PING => Ok(Packet::Ping),
@@ -82,10 +77,13 @@ impl Packet {
     }
 }
 
+// ── MessagePacket ─────────────────────────────────────────────────────────────
+
 impl MessagePacket {
-    /// Parse a MessagePacket from raw bytes.
-    ///
-    /// Layout: [type:4|dest:4] [id] [size] [text...] [checksum]
+    pub fn new(dest: u8, id: u8, text: String<MAX_TEXT>) -> Self {
+        Self { dest, id, text }
+    }
+
     fn parse(raw: &[u8]) -> Result<Self, ProtocolError> {
         if raw.len() < OVERHEAD {
             return Err(ProtocolError::TooShort);
@@ -102,8 +100,9 @@ impl MessagePacket {
 
         let payload = &raw[HEADER_SIZE..HEADER_SIZE + size];
         let received_checksum = raw[HEADER_SIZE + size];
-        let computed = checksum(payload);
 
+        // Checksum covers header bytes + payload bytes.
+        let computed = checksum(&raw[..HEADER_SIZE + size]);
         if received_checksum != computed {
             return Err(ProtocolError::BadChecksum);
         }
@@ -114,12 +113,13 @@ impl MessagePacket {
         Ok(Self { dest, id, text })
     }
 
-    /// Encode into a caller-provided buffer. Returns the number of bytes written.
+    /// Encode into `buf`. Returns the number of bytes written, or `None` if
+    /// `buf` is too small or the text exceeds `MAX_TEXT`.
     pub fn encode(&self, buf: &mut [u8]) -> Option<usize> {
         let text_bytes = self.text.as_bytes();
         let frame_len = HEADER_SIZE + text_bytes.len() + CHECKSUM_SIZE;
 
-        if buf.len() < frame_len {
+        if buf.len() < frame_len || text_bytes.len() > MAX_TEXT {
             return None;
         }
 
@@ -127,13 +127,21 @@ impl MessagePacket {
         buf[1] = self.id;
         buf[2] = text_bytes.len() as u8;
         buf[HEADER_SIZE..HEADER_SIZE + text_bytes.len()].copy_from_slice(text_bytes);
-        buf[HEADER_SIZE + text_bytes.len()] = checksum(text_bytes);
+
+        // Checksum covers header + payload (same range as parse).
+        buf[HEADER_SIZE + text_bytes.len()] = checksum(&buf[..HEADER_SIZE + text_bytes.len()]);
 
         Some(frame_len)
     }
 }
 
+// ── AckPacket ─────────────────────────────────────────────────────────────────
+
 impl AckPacket {
+    pub fn new(id: u8) -> Self {
+        Self { id }
+    }
+
     fn parse(raw: &[u8]) -> Result<Self, ProtocolError> {
         if raw.len() < 2 {
             return Err(ProtocolError::TooShort);
@@ -141,6 +149,8 @@ impl AckPacket {
         Ok(Self { id: raw[1] })
     }
 
+    /// Encode into `buf`. Returns the number of bytes written, or `None` if
+    /// `buf` is too small.
     pub fn encode(&self, buf: &mut [u8]) -> Option<usize> {
         if buf.len() < 2 {
             return None;
@@ -151,185 +161,70 @@ impl AckPacket {
     }
 }
 
-pub enum RxResult {
-    NewMessage {
-        packet: MessagePacket,
-        ack_reply: [u8; 2],
-    },
-    Duplicate {
-        ack_reply: [u8; 2],
-    },
-    AckReceived {
-        id: u8,
-    },
-    UnexpectedAck {
-        id: u8,
-    },
-    ParseError(ProtocolError),
-}
+// ── Convenience helpers ───────────────────────────────────────────────────────
 
-pub enum TimeoutAction {
-    Retry {
-        id: u8,
-        wire_payload: Vec<u8, LORA_MAX_PAYLOAD>,
-    },
-    GiveUp {
-        id: u8,
-    },
-}
-
-// --- Protocol state machine ---
-
-struct PendingAck {
-    wire_payload: Vec<u8, LORA_MAX_PAYLOAD>,
-    id: u8,
-    retries_left: u8,
-    deadline: Instant,
-}
-
-pub struct Protocol {
-    next_seq: u8,
-    pending: Vec<PendingAck, MAX_PENDING_ACKS>,
-    seen_ids: Vec<u8, DEDUP_WINDOW>,
-}
-
-fn encode_ack(id: u8) -> [u8; 2] {
+/// Encode an ACK for `id` into a fixed 2-byte array. Always succeeds.
+pub fn encode_ack(id: u8) -> [u8; 2] {
     let mut buf = [0u8; 2];
-    AckPacket { id }.encode(&mut buf);
+    AckPacket::new(id).encode(&mut buf);
     buf
 }
 
-impl Protocol {
-    pub fn new() -> Self {
-        Self {
-            next_seq: 0,
-            pending: Vec::new(),
-            seen_ids: Vec::new(),
-        }
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_text(s: &str) -> String<MAX_TEXT> {
+        String::try_from(s).unwrap()
     }
 
-    pub fn on_receive(&mut self, buf: &[u8], len: usize) -> RxResult {
-        let raw = match buf.get(..len) {
-            Some(r) => r,
-            None => return RxResult::ParseError(ProtocolError::TooShort),
-        };
+    #[test]
+    fn message_roundtrip() {
+        let msg = MessagePacket::new(3, 42, make_text("hello"));
+        let mut buf = [0u8; LORA_MAX_PAYLOAD];
+        let len = msg.encode(&mut buf).unwrap();
 
-        match Packet::parse(raw) {
-            Ok(Packet::Message(msg)) => {
-                let ack_reply = encode_ack(msg.id);
-
-                if self.is_duplicate(msg.id) {
-                    RxResult::Duplicate { ack_reply }
-                } else {
-                    self.record_seen(msg.id);
-                    RxResult::NewMessage {
-                        packet: msg,
-                        ack_reply,
-                    }
-                }
+        match Packet::parse(&buf[..len]).unwrap() {
+            Packet::Message(m) => {
+                assert_eq!(m.dest, 3);
+                assert_eq!(m.id, 42);
+                assert_eq!(m.text.as_str(), "hello");
             }
-            Ok(Packet::Ack(ack)) => {
-                if self.remove_pending(ack.id) {
-                    RxResult::AckReceived { id: ack.id }
-                } else {
-                    RxResult::UnexpectedAck { id: ack.id }
-                }
-            }
-            Ok(_) => {
-                // TODO: handle Ping, Gps, Resend
-                RxResult::ParseError(ProtocolError::InvalidType(0))
-            }
-            Err(e) => RxResult::ParseError(e),
+            _ => panic!("expected Message"),
         }
     }
 
-    pub fn frame_outgoing(
-        &mut self,
-        dest: u8,
-        raw_text: &[u8],
-    ) -> Option<(u8, Vec<u8, LORA_MAX_PAYLOAD>)> {
-        if self.pending.is_full() {
-            return None;
+    #[test]
+    fn ack_roundtrip() {
+        let ack = encode_ack(7);
+        match Packet::parse(&ack).unwrap() {
+            Packet::Ack(a) => assert_eq!(a.id, 7),
+            _ => panic!("expected Ack"),
         }
-
-        let text_str = core::str::from_utf8(raw_text).ok()?;
-        let text = String::try_from(text_str).ok()?;
-
-        let id = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-
-        let msg = MessagePacket { dest, id, text };
-        let mut wire: Vec<u8, LORA_MAX_PAYLOAD> = Vec::new();
-        wire.resize_default(LORA_MAX_PAYLOAD).ok();
-        let len = msg.encode(&mut wire)?;
-        wire.truncate(len);
-
-        self.pending
-            .push(PendingAck {
-                wire_payload: wire.clone(),
-                id,
-                retries_left: MAX_RETRIES,
-                deadline: Instant::now() + ACK_TIMEOUT,
-            })
-            .ok();
-
-        Some((id, wire))
     }
 
-    // --- Timeout path ---
-    pub fn earliest_deadline(&self) -> Option<Instant> {
-        self.pending.iter().map(|p| p.deadline).min()
+    #[test]
+    fn bad_checksum_rejected() {
+        let msg = MessagePacket::new(0, 1, make_text("test"));
+        let mut buf = [0u8; LORA_MAX_PAYLOAD];
+        let len = msg.encode(&mut buf).unwrap();
+        buf[len - 1] ^= 0xFF; // corrupt checksum
+        assert_eq!(Packet::parse(&buf[..len]), Err(ProtocolError::BadChecksum));
     }
 
-    pub fn process_timeouts(&mut self, now: Instant) -> Vec<TimeoutAction, MAX_PENDING_ACKS> {
-        let mut actions: Vec<TimeoutAction, MAX_PENDING_ACKS> = Vec::new();
-
-        let mut i = self.pending.len();
-        while i > 0 {
-            i -= 1;
-
-            if self.pending[i].deadline > now {
-                continue;
-            }
-
-            if self.pending[i].retries_left > 0 {
-                self.pending[i].retries_left -= 1;
-                let attempt = (MAX_RETRIES - self.pending[i].retries_left) as u32;
-                self.pending[i].deadline = now + ACK_TIMEOUT * attempt;
-
-                actions
-                    .push(TimeoutAction::Retry {
-                        id: self.pending[i].id,
-                        wire_payload: self.pending[i].wire_payload.clone(),
-                    })
-                    .ok();
-            } else {
-                let id = self.pending[i].id;
-                self.pending.remove(i);
-                actions.push(TimeoutAction::GiveUp { id }).ok();
-            }
-        }
-
-        actions
+    #[test]
+    fn too_short_rejected() {
+        assert_eq!(Packet::parse(&[]), Err(ProtocolError::TooShort));
+        assert_eq!(
+            Packet::parse(&[TYPE_MESSAGE << 4, 0]),
+            Err(ProtocolError::TooShort)
+        );
     }
 
-    fn is_duplicate(&self, id: u8) -> bool {
-        self.seen_ids.contains(&id)
-    }
-
-    fn record_seen(&mut self, id: u8) {
-        if self.seen_ids.is_full() {
-            self.seen_ids.remove(0);
-        }
-        self.seen_ids.push(id).ok();
-    }
-
-    fn remove_pending(&mut self, id: u8) -> bool {
-        if let Some(pos) = self.pending.iter().position(|p| p.id == id) {
-            self.pending.remove(pos);
-            true
-        } else {
-            false
-        }
+    #[test]
+    fn unknown_type_rejected() {
+        assert_eq!(Packet::parse(&[0xF0]), Err(ProtocolError::InvalidType(0xF)));
     }
 }
